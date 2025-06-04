@@ -1,8 +1,13 @@
 import datetime
 import os
 import time
+import copy
+import random 
+import sys
+import shutil
 import warnings
 
+import pandas as pd
 import presets
 import torch
 import torch.utils.data
@@ -14,14 +19,18 @@ from torch import nn
 from torch.utils.data.dataloader import default_collate
 from torchvision.transforms.functional import InterpolationMode
 from transforms import get_mixup_cutmix
+from torch.utils.tensorboard import SummaryWriter
+
+from sgd_overshoot import SGDO
 
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema=None, scaler=None):
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, log_writer=None, model_ema=None, scaler=None):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value}"))
     metric_logger.add_meter("img/s", utils.SmoothedValue(window_size=10, fmt="{value}"))
-
+    
+    train_stats = []
     header = f"Epoch: [{epoch}]"
     for i, (image, target) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         start_time = time.time()
@@ -50,6 +59,27 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
             if epoch < args.lr_warmup_epochs:
                 # Reset ema buffer to keep copying weights during warmup period
                 model_ema.n_averaged.fill_(0)
+                
+        if i % args.print_freq == 0:
+            iteration = i + epoch * len(data_loader)
+            if log_writer:
+                log_writer.add_scalar("train_basic_loss", loss.item(), iteration)
+            train_stats.append({"train_basic_loss": loss.item()})
+            if hasattr(optimizer, 'move_to_base'):
+                optimizer.move_to_base()
+                eval_model = copy.deepcopy(model)
+                optimizer.move_to_overshoot()
+                with torch.inference_mode():    
+                    output = eval_model(image)
+                    shifted_loss = criterion(output, target).item()
+                        
+                if log_writer:
+                    log_writer.add_scalar("train_shifted_to_base_loss", shifted_loss, iteration)
+                train_stats[-1]["train_shifted_to_base_loss"] = shifted_loss
+            else:
+                if log_writer:
+                    log_writer.add_scalar("train_shifted_to_base_loss", loss.item(), iteration)
+                train_stats.append({"train_shifted_to_base_loss": loss.item()})
 
         acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         batch_size = image.shape[0]
@@ -57,6 +87,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
         metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
         metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
         metric_logger.meters["img/s"].update(batch_size / (time.time() - start_time))
+    return train_stats
 
 
 def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix=""):
@@ -99,7 +130,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
     metric_logger.synchronize_between_processes()
 
     print(f"{header} Acc@1 {metric_logger.acc1.global_avg:.3f} Acc@5 {metric_logger.acc5.global_avg:.3f}")
-    return metric_logger.acc1.global_avg
+    # return metric_logger.acc1.global_avg
+    return loss.item(), acc1.item(), acc5.item()
 
 
 def _get_cache_path(filepath):
@@ -204,17 +236,31 @@ def load_data(traindir, valdir, args):
 def main(args):
     if args.output_dir:
         utils.mkdir(args.output_dir)
+        
+    # Prepare logs
+    if os.getenv("LOCAL_RANK", '0') == '0':
+        base_dir = os.path.join(args.results_dir, "imagenet-tuned", f"{args.job_name}_{args.opt}_{args.overshoot}")
+        os.makedirs(base_dir, exist_ok=True)
+        version_dir = os.path.join(base_dir, f"version_{len(os.listdir(base_dir)) + 1}")
+        log_writer = SummaryWriter(log_dir=version_dir) # type: ignore
+        shutil.copy(sys.argv[0], os.path.join(version_dir, 'train.py'))
+    else:
+        log_writer = None
 
     utils.init_distributed_mode(args)
     print(args)
 
     device = torch.device(args.device)
 
-    if args.use_deterministic_algorithms:
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True)
-    else:
-        torch.backends.cudnn.benchmark = True
+    # if args.use_deterministic_algorithms:
+    #     torch.backends.cudnn.benchmark = False
+    #     torch.use_deterministic_algorithms(True)
+    # else:
+    #     torch.backends.cudnn.benchmark = True
+    seed = 1337
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
 
     train_dir = os.path.join(args.data_path, "train")
     val_dir = os.path.join(args.data_path, "val")
@@ -267,7 +313,15 @@ def main(args):
     )
 
     opt_name = args.opt.lower()
-    if opt_name.startswith("sgd"):
+    if opt_name == "sgdo":
+        optimizer = SGDO(
+            parameters,
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            overshoot=args.overshoot,
+        )
+    elif opt_name.startswith("sgd"):
         optimizer = torch.optim.SGD(
             parameters,
             lr=args.lr,
@@ -362,14 +416,23 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
+    train_stats, val_stats = [], []
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
+        new_train_stats = train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, args, log_writer, model_ema, scaler)
+        train_stats.extend(new_train_stats)
         lr_scheduler.step()
-        evaluate(model, criterion, data_loader_test, device=device)
+        # evaluate on validation set
+        if hasattr(optimizer, 'move_to_base'):
+            optimizer.move_to_base()
+            eval_model = copy.deepcopy(model)
+            optimizer.move_to_overshoot()
+        else:
+            eval_model = model
+        loss, acc1, acc5 = evaluate(eval_model, criterion, data_loader_test, device=device)
         if model_ema:
-            evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
+            ema_loss, ema_acc1, ema_acc5 = evaluate(model_ema, criterion, data_loader_test, device=device, log_suffix="EMA")
         if args.output_dir:
             checkpoint = {
                 "model": model_without_ddp.state_dict(),
@@ -384,6 +447,14 @@ def main(args):
                 checkpoint["scaler"] = scaler.state_dict()
             utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
             utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+            
+        if os.getenv("LOCAL_RANK", '0') == '0':
+            val_stats.append({"validation_acc1": acc1, "validation_acc5": acc5, "validation_loss": loss})
+            log_writer.add_scalar("validation_loss", loss, epoch)
+            log_writer.add_scalar("validation_acc1", acc1, epoch)
+            log_writer.add_scalar("validation_acc5", acc5, epoch)
+            pd.DataFrame(train_stats).to_csv(os.path.join(version_dir, "training_stats.csv"), index=False)
+            pd.DataFrame(val_stats).to_csv(os.path.join(version_dir, "validation_stats.csv"), index=False)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -394,8 +465,10 @@ def get_args_parser(add_help=True):
     import argparse
 
     parser = argparse.ArgumentParser(description="PyTorch Classification Training", add_help=add_help)
-
+    parser.add_argument('--results_dir', type=str, default="/home/kopal/benchmarking-overshoot/results")
+    parser.add_argument('--job-name', type=str, required=True)
     parser.add_argument("--data-path", default="/datasets01/imagenet_full_size/061417/", type=str, help="dataset path")
+    parser.add_argument("--overshoot", default=0, type=float, help="overshoot to use")
     parser.add_argument("--model", default="resnet18", type=str, help="model name")
     parser.add_argument("--device", default="cuda", type=str, help="device (Use cuda or cpu Default: cuda)")
     parser.add_argument(
@@ -450,7 +523,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-gamma", default=0.1, type=float, help="decrease lr by a factor of lr-gamma")
     parser.add_argument("--lr-min", default=0.0, type=float, help="minimum lr of lr schedule (default: 0.0)")
     parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-    parser.add_argument("--output-dir", default=".", type=str, help="path to save outputs")
+    parser.add_argument("--output-dir", default="", type=str, help="path to save outputs")
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument(
