@@ -79,7 +79,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
             else:
                 if log_writer:
                     log_writer.add_scalar("train_shifted_to_base_loss", loss.item(), iteration)
-                train_stats.append({"train_shifted_to_base_loss": loss.item()})
+                train_stats[-1]["train_shifted_to_base_loss"] = loss.item()
 
         acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
         batch_size = image.shape[0]
@@ -129,9 +129,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
 
     metric_logger.synchronize_between_processes()
 
-    print(f"{header} Acc@1 {metric_logger.acc1.global_avg:.3f} Acc@5 {metric_logger.acc5.global_avg:.3f}")
-    # return metric_logger.acc1.global_avg
-    return loss.item(), acc1.item(), acc5.item()
+    print(f"{header} Acc@1 {metric_logger.acc1.global_avg:.3f} Acc@5 {metric_logger.acc5.global_avg:.3f} Loss: {metric_logger.loss.global_avg:.3f}")
+    return metric_logger.loss.global_avg, metric_logger.acc1.global_avg, metric_logger.acc5.global_avg
 
 
 def _get_cache_path(filepath):
@@ -522,7 +521,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-step-size", default=30, type=int, help="decrease lr every step-size epochs")
     parser.add_argument("--lr-gamma", default=0.1, type=float, help="decrease lr by a factor of lr-gamma")
     parser.add_argument("--lr-min", default=0.0, type=float, help="minimum lr of lr schedule (default: 0.0)")
-    parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
+    parser.add_argument("--print-freq", default=100, type=int, help="print frequency")
     parser.add_argument("--output-dir", default="", type=str, help="path to save outputs")
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
